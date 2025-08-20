@@ -25,7 +25,7 @@ nltk.download('stopwords')
 nltk.download('wordnet')
 
 # Load and preprocess data
-data_file = 'dataAI.json'
+data_file = '../Data/dataAI.json'
 if os.path.exists(data_file):
     data = pd.read_json(data_file)
 else:

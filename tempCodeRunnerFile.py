@@ -19,7 +19,7 @@ nltk.download('stopwords')
 nltk.download('wordnet')
 
 # Load the data
-data = pd.read_json('dataAI.json')
+data = pd.read_json('Data/dataAI.json')
 
 # Extract questions and answers
 questions = data['question']
