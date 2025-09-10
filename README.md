@@ -32,10 +32,11 @@ EsscoAI/
 │ ├── feedback.jsonl 
 │ └── training_ready.jsonl 
 ├── AI/
-│ ├── company_ai_specialty.py 
-│ ├── router.py 
-│ ├── Model.py
+│ ├── feedback.py  
+│ ├── Model.py 
 ├── WebDesign/
+│ ├──API/
+│ │ ├──API.py
 ├── main.py
 └── README.md
 ```

@@ -5,13 +5,19 @@ import pickle
 from pathlib import Path
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from typing import Tuple, List, Optional, Dict, Any, Union
+from typing import Tuple, List, Optional, Dict, Any, Union, Protocol
 from dataclasses import dataclass, field
 import logging
 import re
 import time
 from functools import lru_cache
 import hashlib
+from abc import ABC,abstractmethod
+import psutil,gc
+
+import bleach
+from html import escape
+
 
 try:
     from .feedback_store import FeedbackStore
@@ -28,10 +34,39 @@ QA=[
     ("q", "a"),
 ]
 
+class QASystemError(Exception):...
+class DataValidationError(QASystemError):...
+class RetrievalError(QASystemError):...
+class IndexBuildError(QASystemError):...
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger=logging.getLogger(__name__)
 
+@dataclass
+class QAConfig:
+    similarity_threshold: float = 0.15
+    max_features: int = 100000
+    use_cache: bool = True
+    preprocessing: bool = True
+    max_query:int=500
+    min_answer:int=3
+    fuzzy:bool=True
+    boost_exact:bool=True
+    vectorizer_params:Dict[str, Any] = field(default_factory=lambda: {
+        'analyzer': 'word', 'ngram_range': (1, 3), 'max_features': 100000,
+        'min_df': 2, 'max_df': 0.9, 'stop_words': 'english', 'lowercase': True,
+        'token_pattern': r'\b\w+\b', 'sublinear_tf': True, 'use_idf': True, 'smooth_idf': True })
+
+    @classmethod
+    def from_dict(cls,d:Dict[str,Any])->"QAConfig":
+        return cls(**d)
+
+class QARetrieverInterface(ABC):
+    @abstractmethod
+    def retrieve(self,query:str,top_k:int=3,user_profile:Optional[Dict[str,Any]]=None)->List["RetrievalResult"]:...
+    @abstractmethod
+    def add_qa_pair(self,question:str,answer:str)->bool:...
 
 def get_project_root() -> Path:
     """Get the project root directory (main folder)"""
@@ -60,8 +95,10 @@ class RetrievalResult:
         self.question = str(self.question).strip()
 
 
+
 class QARetriever:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config_obj:QAConfig=QAConfig.from_dict(config or {})
         self.config = self._build_config(config)
         self.vectorizer = None
         self.X = None
@@ -70,6 +107,10 @@ class QARetriever:
         self.a_col = None
         self._cache_file = None
         self._data_hash = None
+
+    def _sanitize_input(self,text: str) -> str:
+        text = bleach.clean(text, tags=[], strip=True)
+        return escape(text)[: self.config_obj.max_query]
 
     def _build_config(self, user_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Build configuration with proper merging and validation"""
@@ -370,7 +411,7 @@ class QARetriever:
             df = df.iloc[valid_indices].reset_index(drop=True)
             questions = valid_questions
 
-        vectorizer = TfidfVectorizer(**self.config['vectorizer_params'])
+        vectorizer = TfidfVectorizer(**self.config_obj.vectorizer_params)
 
 
         try:
@@ -418,7 +459,7 @@ class QARetriever:
         if not query or not query.strip():
             return []
 
-        query = query.strip()
+        query = self._sanitize_input(query.strip())
         if len(query) > self.config.get('max_query_length', 500):
             query = query[:self.config['max_query_length']]
             logger.warning(f"Query truncated to {self.config['max_query_length']} characters")
@@ -594,6 +635,22 @@ class QARetriever:
         extra=store.load_as_qa_pairs(q_key=self.q_col,a_key=self.a_col)
         self.fit_with_extra_pairs(self.df,self.q_col,self.a_col,extra_pairs=extra)
 
+    _memory_threshold_mb:int=1000
+    def _check_memory_usage(self):
+        mem=psutil.Process().memory_info().rss/1024/1024
+        if mem>self._memory_threshold_mb:
+            gc.collect()
+            logger.warning(f'Memory usage: {mem:.1f}MB - triggered cleanup')
+
+    def batch_retrieve_optimized(self,queries:List[str],batch_size:int=32,top_k:int=3)->List[list[RetrievalResult]]:
+        out:List[list[RetrievalResult]]=[]
+        for i in range(0,len(queries),batch_size):
+            batch=queries[i:i+batch_size]
+            for q in batch:
+                out.append(self.retrieve(q,top_k=top_k))
+            if i%(batch_size*4)==0:
+                self._check_memory_usage()
+        return out
 
 def create_interactive_session(retriever: QARetriever,top_k:int=3):
     """Enhanced interactive Q&A session with better UX"""
