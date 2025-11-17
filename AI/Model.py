@@ -18,6 +18,13 @@ import psutil,gc
 import bleach
 from html import escape
 
+import faiss
+import numpy as np
+
+import random
+from typing import Literal
+
+from AI.db import QAPair
 
 try:
     from .feedback_store import FeedbackStore
@@ -42,6 +49,7 @@ class IndexBuildError(QASystemError):...
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger=logging.getLogger(__name__)
+
 
 @dataclass
 class QAConfig:
@@ -70,8 +78,10 @@ class QARetrieverInterface(ABC):
 
 def get_project_root() -> Path:
     """Get the project root directory (main folder)"""
-    current_file = Path(__file__).resolve()
-    return current_file.parent.parent
+
+    return Path(__file__).resolve().parents[1]
+
+DEFUALT_DB_URL=f'sqlite:///{get_project_root()/'Data'/'essco_ai.db'}'
 
 
 def resolve_data_path(relative_path: str) -> Path:
@@ -94,7 +104,157 @@ class RetrievalResult:
         self.answer = str(self.answer).strip()
         self.question = str(self.question).strip()
 
+class DynamicResponseGenerator:
+    def __init__(self):
+        self.intent_pattern=self._build_intent_patterns()
 
+    def _build_intent_patterns(self) -> Dict[str, List[str]]:
+        return { 'greeting': ['hi', 'hello', 'hey', 'greetings', 'good morning', 'good afternoon'],
+            'thanks': ['thank', 'thanks', 'appreciate', 'grateful'],
+            'how_to': [r'^how to', r'^how do i', r'^how can i', r'^how does'],
+            'definition': [r'^what is', r'^what are', r'^what\'s', r"^what's", r'^define'],
+            'location': [r'^where', r'^location'],
+            'time': [r'^when', r'^what time'],
+            'explanation': [r'^why', r'^reason'],
+            'boolean': [r'^is ', r'^are ', r'^can ', r'^do ', r'^does ', r'^will ', r'^would ', r'^should '],
+            'list': ['list', 'compare', 'comparison', 'difference', 'vs', 'versus'],
+        }
+
+    def  detect_intent(self,query:str)->str:
+        q_lower=query.lower().strip()
+
+        for intent,patterns in self.intent_pattern.items():
+            for pattern in patterns:
+                if pattern.startswith('^'):
+                    if re.match(pattern,q_lower):
+                        return intent
+                else:
+                    if pattern in q_lower:
+                        return intent
+        return 'general'
+
+    def generate_response(self,user_query:str,results:List[RetrievalResult])->str:
+        intent=self.detect_intent(user_query)
+        if not results or len(results)==0:
+            return self._handle_no_results(user_query,intent)
+
+        top_match=results[0]
+        confidence=top_match.similarity_score
+        if confidence>=0.7:
+            return self._format_high_confidence(top_match,user_query,intent)
+        elif confidence>=0.4:
+            return self._format_medium_confidence(top_match,results[:3],user_query,intent)
+        else:
+            return self._format_low_confidence(results[:3],user_query,intent)
+
+    def _format_high_confidence(self,match:RetrievalResult,user_text:str,intent:str)->str:
+        answer=match.answer.strip()
+        if not answer:
+            return self._handle_no_results(user_text,intent)
+
+        templates = {
+            'greeting': [
+                f"Hi there! 👋 {answer}",
+                f"Hello! {answer}",
+                f"Hey! {answer}"
+            ],
+            'how_to': [
+                f"Here's how: {answer}",
+                f"To do this: {answer}",
+                f"Let me explain: {answer}",
+                answer
+            ],
+            'definition': [
+                f"Here's what that means: {answer}",
+                f"Simply put: {answer}",
+                answer
+            ],
+            'boolean': [
+                answer,
+                f"Yes, {answer.lower()}" if not answer.lower().startswith(('yes', 'no')) else answer,
+            ],
+            'explanation': [
+                f"Here's why: {answer}",
+                f"The reason is: {answer}",
+                answer
+            ],
+            'general': [
+                answer,
+                f"Based on our knowledge: {answer}",
+                f"Here's what I found: {answer}"
+            ]
+        }
+
+        template_list=templates.get(intent,templates['general'])
+        response=random.choice(template_list)
+
+        if intent in ['how_to','definition'] and random.random()>0.7:
+            follow_ups = [
+                "\n\nNeed more details? Feel free to ask!",
+                "\n\nLet me know if you need clarification!",
+                ""
+            ]
+            response+=random.choice(follow_ups)
+
+        return response
+
+    def _format_medium_confidence(self,top_match:RetrievalResult,
+                                  all_matches:List[RetrievalResult],
+                                  user_text:str,intent:str)->str:
+        answer=top_match.answer.strip()
+
+        if not answer:
+            return self._format_low_confidence(all_matches,user_text,intent)
+
+        intros = [
+            "I think this might help:",
+            "Based on what I found:",
+            "Here's what seems most relevant:",
+            "This might answer your question:"
+        ]
+
+        response=f'{random.choice(intros)} {answer}'
+
+        if len(all_matches) > 1:
+            response += "\n\nI also found some related information. Would you like to know more?"
+
+        return response
+
+    def _format_low_confidence(self,matches:List[RetrievalResult],user_text:str,intent:str)->str:
+        if not matches or len(matches)==0:
+            return self._handle_no_results(user_text,intent)
+        response="I found a few things that might be related:\n\n"
+
+        for i, match in enumerate(matches[:3],1):
+            question=match.question.strip()
+            answer=match.answer.strip()
+
+            if question and answer:
+                answer_preview=answer[:120]+"..." if len(answer)>120 else answer
+                response+=f'{i}. **{question}**\n {answer_preview}\n\n'
+
+        response+="Which of these is closest to what you're looking for?"
+        return response
+
+    def _handle_no_results(self,user_text:str,intent:str)->str:
+        if intent == 'greeting':
+            return "Hi there! 👋 How can I help you today?"
+        if intent == 'thanks':
+            return random.choice([
+                "You're welcome! 😊",
+                "Happy to help!",
+                "Anytime! Let me know if you need anything else.",
+                "Glad I could help!"
+            ])
+        responses = [
+            f"I don't have specific information about that in my knowledge base yet. Could you rephrase your question or ask something more specific?",
+
+            f"Hmm, I couldn't find anything about that. Try asking in a different way, or let me know what specific aspect you're interested in!",
+
+            f"I don't have that information right now. Can you provide more context or ask about something related?",
+        ]
+
+        return random.choice(responses)
 
 class QARetriever:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -107,6 +267,7 @@ class QARetriever:
         self.a_col = None
         self._cache_file = None
         self._data_hash = None
+        self.response_generator=DynamicResponseGenerator()
 
     def _sanitize_input(self,text: str) -> str:
         text = bleach.clean(text, tags=[], strip=True)
@@ -652,6 +813,137 @@ class QARetriever:
                 self._check_memory_usage()
         return out
 
+    def retrieve_with_dynamic_response(self,query:str,top_k:int=3,user_profile:Optional[Dict[str,Any]]=None)->Dict[str,Any]:
+        results=self.retrieve(query,top_k=top_k,user_profile=user_profile)
+        dynamic_answer=self.response_generator.generate_response(query,results)
+        max_score=max((r.similarity_score for r in results),default=0.0)
+
+        return {
+            'query': query,
+            'answer':dynamic_answer,
+            'confidence':max_score,
+            'confidence_label':self._get_confidence_label(max_score),
+            'results':results,
+            'mode':'dynamic_retrieval'
+        }
+
+    def _get_confidence_label(self,score:float)->str:
+        if score>=0.7:
+            return 'high'
+        elif score>=0.4:
+            return 'medium'
+        else:
+            return 'low'
+
+    def retrieve_enhanced(self,query:str,top_k:int=3,user_profile:Optional[Dict[str,Any]]=None) -> List[RetrievalResult]:
+        clean_query=self._enhanced_preprocess(query)
+
+        variations=self._generate_query_variations(clean_query)
+
+        all_results={}
+
+        for variation in variations[:3]:
+            try:
+                results=self.retrieve(variation,top_k=top_k*2,user_profile=user_profile)
+                for r in results:
+                    idx=r.index
+                    if idx not in all_results or r.similarity_score>all_results[idx].similarity_score:
+                        all_results[idx]=r
+            except Exception:
+                continue
+
+        sorted_results=sorted(all_results.values(),key=lambda x:x.similarity_score,reverse=True)
+
+        sorted_results=self._sematic_boost(query,sorted_results)
+        return sorted_results[:top_k]
+
+    def _enhanced_preprocess(self,query:str)->str:
+        q=query.lower().strip()
+
+        fillers=['please', 'can you', 'could you', 'would you', 'i want to',
+                   'i need to', 'how do i', 'tell me', 'help me']
+
+        for f in fillers:
+            q=q.replace(f,'')
+
+        contractions={
+            "won't": "will not",
+            "can't": "cannot",
+            "don't": "do not",
+            "isn't": "is not",
+            "aren't": "are not",
+            "wasn't": "was not",
+            "weren't": "were not",
+        }
+
+        for contraction,expansion in contractions.items():
+            q=q.replace(contraction,expansion)
+
+        return q.strip()
+
+    def _generate_query_variations(self,query:str)->List[str]:
+        variations=[query]
+        q_lower=query.lower()
+
+        question_words = ['what', 'how', 'when', 'where', 'why', 'who']
+        starts_with_question = any(q_lower.startswith(w) for w in question_words)
+
+        if not starts_with_question:
+            variations.append(f'what is {query}')
+            variations.append(f'how to {query}')
+
+        words=query.split()
+        if words and words[0].lower() in question_words:
+            keyword_query=' '.join(words[1:])
+            if keyword_query:
+                variations.append(keyword_query)
+
+        return variations
+
+    def _sematic_boost(self,query:str,result:List[RetrievalResult])->List[RetrievalResult]:
+        if not result:
+            return result
+
+        query_words=set(w.lower() for w in query.split()
+                        if len(w)>3 and w.lower() not in ['what', 'how', 'when', 'where', 'this', 'that', 'with', 'from'])
+
+        if not query_words:
+            return result
+
+        for r in result:
+            question_lower=r.question.lower()
+            answer_lower=r.answer.lower()
+
+            matches=sum(1 for word in query_words if word in question_lower or word in answer_lower)
+
+            if matches>0:
+                boost_factor=1.0+(matches*0.1)
+                r.similarity_score=min(1.0,r.similarity_score*boost_factor)
+
+        result.sort(key=lambda x:x.similarity_score,reverse=True)
+        return result
+
+
+class QARetrieverSQL(QARetriever):
+    def __init__(self,db_url:str=DEFUALT_DB_URL,config=None):
+        super().__init__(config=config)
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        self.engine=create_engine(db_url)
+        self.session=sessionmaker(bind=self.engine)
+
+    def load_and_build(self,_path=None,force_rebuild=False):
+        session=self.session()
+        rows=session.query(QAPair).all()
+        session.close()
+
+        records=[{"question":r.question, "answer":r.answer} for r in rows]
+        df=pd.DataFrame(records)
+
+        self.df=self._clean_dataframe(df,"question",'answer')
+        self.q_col,self.a_col="question","answer"
+        self.vectorizer,self.X, self.df=self.build_index(self.df,self.q_col)
+
 def create_interactive_session(retriever: QARetriever,top_k:int=3):
     """Enhanced interactive Q&A session with better UX"""
     print(f"\n{'=' * 60}")
@@ -1191,6 +1483,7 @@ Examples:
         return 1
 
     return 0
+
 
 
 if __name__ == '__main__':

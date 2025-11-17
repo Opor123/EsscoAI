@@ -30,13 +30,21 @@ Future phases will expand into product, pricing, and customer support integratio
 EsscoAI/
 ├── Data/
 │ ├── feedback.jsonl 
-│ └── training_ready.jsonl 
+│ ├── training_ready.jsonl 
+│ └── essco_ai.db
 ├── AI/
 │ ├── feedback.py  
-│ ├── Model.py 
+│ ├── Model.py
+│ ├── jsonToSQL.py
+│ ├── db.py
+│ ├── llm_service.py
 ├── WebDesign/
 │ ├──API/
 │ │ ├──API.py
+│ ├── static/
+│ │ ├── main.html
+│ │ ├── script.js
+│ │ ├── style.css
 ├── main.py
 └── README.md
 ```
