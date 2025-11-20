@@ -1,24 +1,23 @@
 """
 LLM Service for Enhanced Q&A Responses
-Supports both OpenAI and Anthropic APIs
+Supports OpenAI, Anthropic, and LOCAL LLMs (Ollama, LM Studio, etc.)
 """
 import os
 import logging
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 import time
+import requests
 
-# Try importing both providers
+# Try importing cloud providers
 try:
     from anthropic import Anthropic, APIError as AnthropicAPIError, RateLimitError as AnthropicRateLimitError
-
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
 try:
     from openai import OpenAI, APIError as OpenAIAPIError, RateLimitError as OpenAIRateLimitError
-
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
@@ -29,53 +28,57 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LLMConfig:
     """Configuration for LLM service"""
-    provider: str = "openai"  # "openai" or "anthropic"
+    provider: str = "ollama"  # "openai", "anthropic", "ollama", "lmstudio", "openai-compatible"
     api_key: Optional[str] = None
-    model: str = "gpt-4o-mini"  # Default OpenAI model
+    model: str = "llama3.2"  # Default local model
+    base_url: str = "http://localhost:11434"  # Ollama default
     max_tokens: int = 1000
     confidence_threshold: float = 0.6
     temperature: float = 0.7
-    timeout: int = 30
+    timeout: int = 60  # Increased for local models
     max_context_results: int = 3
     enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
         """Load configuration from environment variables"""
-        # Determine provider based on available API keys
-        provider = os.getenv("ESSCOAI_LLM_PROVIDER", "auto")
+        provider = os.getenv("ESSCOAI_LLM_PROVIDER", "ollama")
 
-        openai_key = os.getenv("ESSCO_AI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        # Base URLs for different providers
+        base_url_map = {
+            "ollama": "http://localhost:11434",
+            "lmstudio": "http://localhost:1234",
+            "openai-compatible": os.getenv("ESSCOAI_LLM_BASE_URL", "http://localhost:8000")
+        }
 
-        # Auto-detect provider
-        if provider == "auto":
-            if openai_key and OPENAI_AVAILABLE:
-                provider = "openai"
-                api_key = openai_key
-            elif anthropic_key and ANTHROPIC_AVAILABLE:
-                provider = "anthropic"
-                api_key = anthropic_key
-            else:
-                provider = "openai"  # Default
-                api_key = openai_key
-        elif provider == "openai":
-            api_key = openai_key
-        else:
-            api_key = anthropic_key
+        # Model defaults
+        model_defaults = {
+            "ollama": "llama3.2",
+            "lmstudio": "local-model",
+            "openai": "gpt-4o-mini",
+            "anthropic": "claude-sonnet-4-20250514",
+            "openai-compatible": "local-model"
+        }
 
-        # Set default model based on provider
-        default_model = "gpt-4o-mini" if provider == "openai" else "claude-sonnet-4-20250514"
-        model = os.getenv("ESSCOAI_LLM_MODEL", default_model)
+        # Get API key if using cloud providers
+        api_key = None
+        if provider == "openai":
+            api_key = os.getenv("ESSCO_AI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        elif provider == "anthropic":
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+
+        base_url = os.getenv("ESSCOAI_LLM_BASE_URL", base_url_map.get(provider, "http://localhost:11434"))
+        model = os.getenv("ESSCOAI_LLM_MODEL", model_defaults.get(provider, "llama3.2"))
 
         return cls(
             provider=provider,
             api_key=api_key,
             model=model,
+            base_url=base_url,
             max_tokens=int(os.getenv("ESSCOAI_LLM_MAX_TOKENS", "1000")),
             confidence_threshold=float(os.getenv("ESSCOAI_LLM_CONFIDENCE_THRESHOLD", "0.6")),
             temperature=float(os.getenv("ESSCOAI_LLM_TEMPERATURE", "0.7")),
-            timeout=int(os.getenv("ESSCOAI_LLM_TIMEOUT", "30")),
+            timeout=int(os.getenv("ESSCOAI_LLM_TIMEOUT", "60")),
             max_context_results=int(os.getenv("ESSCOAI_LLM_CONTEXT_RESULTS", "3")),
             enabled=os.getenv("ESSCOAI_USE_LLM", "1") == "1"
         )
@@ -84,7 +87,7 @@ class LLMConfig:
 class LLMService:
     """
     Service for integrating LLM with retrieval system
-    Supports both OpenAI and Anthropic APIs
+    Supports cloud APIs and local LLMs
     """
 
     def __init__(self, config: Optional[LLMConfig] = None):
@@ -94,12 +97,43 @@ class LLMService:
 
     def _initialize_client(self):
         """Initialize LLM client based on provider"""
-        if self.config.provider == "openai":
+        if self.config.provider in ["ollama", "lmstudio", "openai-compatible"]:
+            self._initialize_local()
+        elif self.config.provider == "openai":
             self._initialize_openai()
         elif self.config.provider == "anthropic":
             self._initialize_anthropic()
         else:
             logger.error(f"Unknown provider: {self.config.provider}")
+            self.config.enabled = False
+
+    def _initialize_local(self):
+        """Initialize local LLM (Ollama, LM Studio, etc.)"""
+        try:
+            # Test connection
+            if self.config.provider == "ollama":
+                test_url = f"{self.config.base_url}/api/tags"
+            else:
+                test_url = f"{self.config.base_url}/v1/models"
+
+            response = requests.get(test_url, timeout=5)
+
+            if response.status_code == 200:
+                logger.info(f"Local LLM service connected: {self.config.provider} at {self.config.base_url}")
+                logger.info(f"Using model: {self.config.model}")
+                self.client = "local"  # Marker that we're using local
+            else:
+                logger.warning(f"Local LLM server responded with status {response.status_code}")
+                self.config.enabled = False
+
+        except requests.exceptions.ConnectionError:
+            logger.warning(
+                f"Cannot connect to {self.config.provider} at {self.config.base_url}. "
+                f"Make sure the server is running. LLM features disabled."
+            )
+            self.config.enabled = False
+        except Exception as e:
+            logger.error(f"Failed to initialize local LLM: {e}")
             self.config.enabled = False
 
     def _initialize_openai(self):
@@ -110,7 +144,7 @@ class LLMService:
             return
 
         if not self.config.api_key:
-            logger.warning("No OpenAI API key found (ESSCO_AI_API_KEY or OPENAI_API_KEY). LLM features disabled.")
+            logger.warning("No OpenAI API key found. LLM features disabled.")
             self.config.enabled = False
             return
 
@@ -153,20 +187,12 @@ class LLMService:
     def should_use_llm(self, confidence_score: float) -> bool:
         """Determine if LLM should be used based on confidence score"""
         return (
-                self.is_available() and
-                confidence_score < self.config.confidence_threshold
+            self.is_available() and
+            confidence_score < self.config.confidence_threshold
         )
 
     def build_context_from_results(self, results: List[Any]) -> str:
-        """
-        Build context string from retrieval results
-
-        Args:
-            results: List of RetrievalResult objects
-
-        Returns:
-            Formatted context string
-        """
+        """Build context string from retrieval results"""
         if not results:
             return "No relevant information found in the knowledge base."
 
@@ -181,16 +207,7 @@ class LLMService:
         return "\n".join(context_parts)
 
     def create_prompt(self, user_query: str, context: str) -> str:
-        """
-        Create the LLM prompt with context
-
-        Args:
-            user_query: User's original question
-            context: Retrieved context from knowledge base
-
-        Returns:
-            Formatted prompt string
-        """
+        """Create the LLM prompt with context"""
         return f"""You are a helpful AI assistant with access to a knowledge base. Your task is to answer the user's question using ONLY the information provided in the knowledge base entries below.
 
 KNOWLEDGE BASE ENTRIES:
@@ -208,6 +225,92 @@ INSTRUCTIONS:
 
 RESPONSE:"""
 
+    def _call_ollama(self, prompt: str) -> Dict[str, Any]:
+        """Call Ollama API"""
+        try:
+            response = requests.post(
+                f"{self.config.base_url}/api/generate",
+                json={
+                    "model": self.config.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": self.config.temperature,
+                        "num_predict": self.config.max_tokens,
+                    }
+                },
+                timeout=self.config.timeout
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                answer = data.get("response", "").strip()
+
+                return {
+                    'success': True,
+                    'answer': answer,
+                    'tokens_used': {
+                        'input': data.get('prompt_eval_count', 0),
+                        'output': data.get('eval_count', 0),
+                        'total': data.get('prompt_eval_count', 0) + data.get('eval_count', 0)
+                    }
+                }
+            else:
+                logger.error(f"Ollama error: {response.status_code} - {response.text}")
+                return {'success': False, 'error': f'http_{response.status_code}', 'answer': None}
+
+        except requests.exceptions.Timeout:
+            logger.error("Ollama request timed out")
+            return {'success': False, 'error': 'timeout', 'answer': None}
+        except Exception as e:
+            logger.error(f"Ollama call failed: {e}")
+            return {'success': False, 'error': str(e), 'answer': None}
+
+    def _call_openai_compatible(self, prompt: str) -> Dict[str, Any]:
+        """Call OpenAI-compatible API (LM Studio, vLLM, etc.)"""
+        try:
+            response = requests.post(
+                f"{self.config.base_url}/v1/chat/completions",
+                json={
+                    "model": self.config.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant that answers questions based on provided knowledge base entries."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    "max_tokens": self.config.max_tokens,
+                    "temperature": self.config.temperature
+                },
+                timeout=self.config.timeout
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                answer = data['choices'][0]['message']['content'].strip()
+                usage = data.get('usage', {})
+
+                return {
+                    'success': True,
+                    'answer': answer,
+                    'tokens_used': {
+                        'input': usage.get('prompt_tokens', 0),
+                        'output': usage.get('completion_tokens', 0),
+                        'total': usage.get('total_tokens', 0)
+                    }
+                }
+            else:
+                logger.error(f"OpenAI-compatible API error: {response.status_code}")
+                return {'success': False, 'error': f'http_{response.status_code}', 'answer': None}
+
+        except Exception as e:
+            logger.error(f"OpenAI-compatible call failed: {e}")
+            return {'success': False, 'error': str(e), 'answer': None}
+
     def _call_openai(self, prompt: str) -> Dict[str, Any]:
         """Call OpenAI API"""
         try:
@@ -216,7 +319,7 @@ RESPONSE:"""
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a helpful assistant that answers questions based on provided knowledge base entries. Stay grounded in the provided information."
+                        "content": "You are a helpful assistant that answers questions based on provided knowledge base entries."
                     },
                     {
                         "role": "user",
@@ -238,12 +341,6 @@ RESPONSE:"""
                     'total': response.usage.total_tokens
                 }
             }
-        except OpenAIRateLimitError as e:
-            logger.error(f"OpenAI rate limit: {e}")
-            return {'success': False, 'error': 'rate_limit', 'answer': None}
-        except OpenAIAPIError as e:
-            logger.error(f"OpenAI API error: {e}")
-            return {'success': False, 'error': 'api_error', 'answer': None}
         except Exception as e:
             logger.error(f"OpenAI call failed: {e}")
             return {'success': False, 'error': str(e), 'answer': None}
@@ -272,12 +369,6 @@ RESPONSE:"""
                     'total': response.usage.input_tokens + response.usage.output_tokens
                 }
             }
-        except AnthropicRateLimitError as e:
-            logger.error(f"Anthropic rate limit: {e}")
-            return {'success': False, 'error': 'rate_limit', 'answer': None}
-        except AnthropicAPIError as e:
-            logger.error(f"Anthropic API error: {e}")
-            return {'success': False, 'error': 'api_error', 'answer': None}
         except Exception as e:
             logger.error(f"Anthropic call failed: {e}")
             return {'success': False, 'error': str(e), 'answer': None}
@@ -288,17 +379,7 @@ RESPONSE:"""
             retrieval_results: List[Any],
             system_prompt: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Enhance response using LLM
-
-        Args:
-            user_query: User's question
-            retrieval_results: List of RetrievalResult objects from retrieval
-            system_prompt: Optional custom system prompt
-
-        Returns:
-            Dictionary with enhanced response and metadata
-        """
+        """Enhance response using LLM"""
         if not self.is_available():
             return {
                 'success': False,
@@ -311,14 +392,16 @@ RESPONSE:"""
 
             # Build context from retrieval results
             context = self.build_context_from_results(retrieval_results)
-
-            # Create prompt
             prompt = self.create_prompt(user_query, context)
 
             # Call appropriate API
-            if self.config.provider == "openai":
+            if self.config.provider == "ollama":
+                api_result = self._call_ollama(prompt)
+            elif self.config.provider in ["lmstudio", "openai-compatible"]:
+                api_result = self._call_openai_compatible(prompt)
+            elif self.config.provider == "openai":
                 api_result = self._call_openai(prompt)
-            else:
+            else:  # anthropic
                 api_result = self._call_anthropic(prompt)
 
             if not api_result['success']:
@@ -328,7 +411,7 @@ RESPONSE:"""
 
             logger.info(
                 f"LLM enhancement completed in {elapsed_time:.2f}s "
-                f"(provider: {self.config.provider}, "
+                f"(provider: {self.config.provider}, model: {self.config.model}, "
                 f"tokens: {api_result['tokens_used']['input']} in, "
                 f"{api_result['tokens_used']['output']} out)"
             )
@@ -358,19 +441,7 @@ RESPONSE:"""
             confidence_score: float,
             fallback_answer: str
     ) -> Dict[str, Any]:
-        """
-        Main processing method - decides whether to use LLM and returns response
-
-        Args:
-            user_query: User's question
-            retrieval_results: Results from retrieval system
-            confidence_score: Confidence score from retrieval
-            fallback_answer: Answer to use if LLM fails or isn't needed
-
-        Returns:
-            Dictionary with answer and metadata
-        """
-        # Check if we should use LLM
+        """Main processing method"""
         if not self.should_use_llm(confidence_score):
             return {
                 'answer': fallback_answer,
@@ -380,7 +451,6 @@ RESPONSE:"""
                 'reason': 'High confidence - retrieval sufficient'
             }
 
-        # Try LLM enhancement
         llm_result = self.enhance_with_llm(user_query, retrieval_results)
 
         if llm_result['success']:
@@ -399,7 +469,6 @@ RESPONSE:"""
                 'reason': f'Low confidence - enhanced with {llm_result["provider"].title()}'
             }
         else:
-            # LLM failed, fall back to retrieval answer
             logger.warning(f"LLM enhancement failed, using fallback: {llm_result.get('error')}")
             return {
                 'answer': fallback_answer,

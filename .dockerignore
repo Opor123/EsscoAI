@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Logs
+*.log
+
+# Test files
+tests/
+test_*.py
+
+# Documentation
+*.md
+docs/
+
+# Environment files (will be set in Docker)
+.env
+.env.local
+
+# Large model files (if any)
+*.bin
+*.gguf
+*.safetensors
